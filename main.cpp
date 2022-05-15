@@ -8,13 +8,13 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <set>
 #include <stdexcept>
 #include <vector>
 
-const uint32_t WIDTH = 800;
-const uint32_t HEIGHT = 600;
+#include "window.h"
 
 VkResult CreateDebugUtilsMessengerEXT(VkInstance instance, const VkDebugUtilsMessengerCreateInfoEXT* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkDebugUtilsMessengerEXT* pDebugMessenger)
 {
@@ -124,25 +124,23 @@ VkPresentModeKHR chooseSwapChainPresentMode(const std::vector<VkPresentModeKHR>&
     return VK_PRESENT_MODE_FIFO_KHR;
 }
 
-struct HelloTriangleApplication {
+class HelloTriangleApplication {
 public:
     HelloTriangleApplication()
-        : instance {}
+        : window { "Vulkan App", { .width = 640, .height = 480 } }
+        , instance {}
         , debugMessenger {}
     {
-        window = nullptr;
     }
-    ~HelloTriangleApplication() { window = nullptr; }
     void run()
     {
-        initWindow();
         initVulkan();
         mainLoop();
         cleanUp();
     }
 
 private:
-    GLFWwindow* window;
+    AppWindow window;
     VkInstance instance;
     VkDebugUtilsMessengerEXT debugMessenger;
     VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
@@ -161,23 +159,11 @@ private:
     VkPipeline graphicsPipeline;
     VkCommandPool commandPool; // write up on implicit destruction.
     VkCommandBuffer commandBuffer;
+    VkSemaphore imageAvailableSemaphore;
+    VkSemaphore renderFinishedSemaphore;
+    VkFence inFlightFence;
 
 private:
-    void initWindow()
-    {
-        std::cout << "[info] initializing glfw." << std::endl;
-        glfwInit();
-
-        // tell glfw that we are not interested in opengl.
-        glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-
-        // no need for unnecessary code to handle window resizes (for now).
-        glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
-
-        std::cout << "[info] creating window." << std::endl;
-        this->window = glfwCreateWindow(WIDTH, HEIGHT, "Hello Triangle", nullptr, nullptr);
-    }
-
     void initVulkan()
     {
         createInstance();
@@ -192,6 +178,31 @@ private:
         createFramebuffers();
         createCommandPool();
         createCommandBuffer();
+        createSyncObjects();
+    }
+
+    void createSyncObjects()
+    {
+        VkSemaphoreCreateInfo semaphoreCreateInfo {
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+        };
+
+        VkFenceCreateInfo fenceCreateInfo {
+            .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+            .flags = VK_FENCE_CREATE_SIGNALED_BIT
+        };
+
+        if (vkCreateSemaphore(this->device, &semaphoreCreateInfo, nullptr, &imageAvailableSemaphore) != VK_SUCCESS) {
+            throw std::runtime_error("[error] failed to create imageAvailableSemaphore.");
+        }
+
+        if (vkCreateSemaphore(this->device, &semaphoreCreateInfo, nullptr, &renderFinishedSemaphore) != VK_SUCCESS) {
+            throw std::runtime_error("[error] failed to create renderFinishedSemaphore.");
+        }
+
+        if (vkCreateFence(this->device, &fenceCreateInfo, nullptr, &inFlightFence) != VK_SUCCESS) {
+            throw std::runtime_error("[error] failed to create inFlightFence.");
+        }
     }
 
     void createCommandBuffer()
@@ -588,7 +599,7 @@ private:
         } else {
             int width, height;
 
-            glfwGetFramebufferSize(window, &width, &height);
+            glfwGetFramebufferSize(window.getWindow(), &width, &height);
 
             VkExtent2D actualExtent = {
                 .width = static_cast<uint32_t>(width),
@@ -604,7 +615,7 @@ private:
 
     void createSurface()
     {
-        if (glfwCreateWindowSurface(this->instance, window, nullptr, &this->surface) != VK_SUCCESS) {
+        if (glfwCreateWindowSurface(this->instance, window.getWindow(), nullptr, &this->surface) != VK_SUCCESS) {
             throw std::runtime_error("[error] failed to create window surface.");
         }
     }
@@ -817,12 +828,46 @@ private:
 
     void drawFrame()
     {
-        //outline of a frame.
+        // outline of a frame.
+        // vulkan users explictly orchestrate drawing, allocation,
+        // and presentation on the gpu + cpu and gpu operations.
+
+        vkWaitForFences(device, 1, &inFlightFence, VK_TRUE, UINT64_MAX);
+        vkResetFences(device, 1, &inFlightFence);
+
+        uint32_t imageIndex;
+        vkAcquireNextImageKHR(device, swapChain, UINT64_MAX, imageAvailableSemaphore, VK_NULL_HANDLE, &imageIndex);
+
+        vkResetCommandBuffer(commandBuffer, 0);
+        recordCommandBuffer(commandBuffer, imageIndex);
+
+        // submitting the command buffer.
+
+        VkSemaphore waitSemaphores[] { imageAvailableSemaphore };
+        VkPipelineStageFlags waitStages[] = { VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT };
+        VkCommandBuffer commandBuffers[] = { commandBuffer };
+        VkSemaphore signalSemaphores[] = { renderFinishedSemaphore };
+
+        VkSubmitInfo submitInfo {
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .waitSemaphoreCount = 1,
+            .pWaitSemaphores = waitSemaphores,
+            .pWaitDstStageMask = waitStages,
+            .commandBufferCount = 1,
+            .pCommandBuffers = commandBuffers,
+            .signalSemaphoreCount = 1,
+            .pSignalSemaphores = signalSemaphores
+        };
+
+        if (vkQueueSubmit(graphicsQueue, 1, &submitInfo, inFlightFence) != VK_SUCCESS) {
+            throw std::runtime_error("[error] command buffer sumission to the graphics queue failed.");
+        }
+        
     }
 
     void mainLoop()
     {
-        while (!glfwWindowShouldClose(this->window)) {
+        while (!glfwWindowShouldClose(window.getWindow())) {
             glfwPollEvents();
             drawFrame();
         }
@@ -830,6 +875,12 @@ private:
 
     void cleanUp()
     {
+        std::cout << "[info] destroying image available semaphore." << std::endl;
+        vkDestroySemaphore(this->device, this->imageAvailableSemaphore, nullptr);
+        std::cout << "[info] destroying rendering finished semaphore." << std::endl;
+        vkDestroySemaphore(this->device, this->renderFinishedSemaphore, nullptr);
+        std::cout << "[info] destroying inflight frame fence." << std::endl;
+        vkDestroyFence(this->device, this->inFlightFence, nullptr);
         std::cout << "[info] destroying command pool." << std::endl;
         vkDestroyCommandPool(this->device, this->commandPool, nullptr);
         std::cout << "[info] destroying framebuffers" << std::endl;
@@ -837,7 +888,7 @@ private:
         for (auto framebuffer : this->swapChainFramebuffers) {
             vkDestroyFramebuffer(this->device, framebuffer, nullptr);
             std::cout << "\t"
-                      << "[info] destroyed framebuffer object at index "
+                      << "destroyed framebuffer object at index "
                       << i << std::endl;
             i++;
         }
@@ -852,7 +903,7 @@ private:
         for (auto imageView : swapChainImageViews) {
             vkDestroyImageView(this->device, imageView, nullptr);
             std::cout << "\t"
-                      << "[info] destroyed image view number " << j << std::endl;
+                      << "destroyed image view number " << j << std::endl;
             j++;
         }
         if (enableValidation) {
@@ -866,10 +917,6 @@ private:
         vkDestroySurfaceKHR(this->instance, this->surface, nullptr);
         std::cout << "[info] destroying vk instance." << std::endl;
         vkDestroyInstance(this->instance, nullptr);
-        std::cout << "[info] destroying window." << std::endl;
-        glfwDestroyWindow(this->window);
-        std::cout << "[info] terminating glfw." << std::endl;
-        glfwTerminate();
     }
 
     bool checkValidationLayerSupport()
@@ -993,9 +1040,8 @@ private:
 
 int main()
 {
-    HelloTriangleApplication app;
-
     try {
+        HelloTriangleApplication app;
         app.run();
     } catch (const std::exception& e) {
         std::cerr << e.what() << std::endl;
